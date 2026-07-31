@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>大學現金流量表勾稽底稿產生器</title>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.27.3/full/pyodide.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0 auto; padding: 1.5rem 1rem 3rem; max-width: 46rem; line-height: 1.6;
+         font-family: system-ui, "Noto Sans TC", "PingFang TC", sans-serif; }
+  h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+  .sub { color: #666; margin: 0 0 1.25rem; }
+  .note { padding: .75rem 1rem; background: #eef6ee; border: 1px solid #cfe3cf;
+          border-radius: .5rem; font-size: .9rem; color: #2c4a2c; margin-bottom: 1.5rem; }
+  label { display: block; font-weight: 600; margin: 1rem 0 .35rem; }
+  input[type=file], input[type=text] { width: 100%; padding: .5rem; box-sizing: border-box;
+          border: 1px solid #bbb; border-radius: .4rem; background: transparent; color: inherit; }
+  button { margin-top: 1.5rem; width: 100%; padding: .75rem; font-size: 1rem; font-weight: 600;
+           border: 0; border-radius: .4rem; background: #d05a1e; color: #fff; cursor: pointer; }
+  button:disabled { background: #999; cursor: progress; }
+  pre { margin-top: 1.5rem; padding: 1rem; background: #f4f4f4; border-radius: .5rem;
+        white-space: pre-wrap; word-break: break-all; font-size: .85rem; min-height: 3rem; }
+  a.dl { display: block; margin-top: 1rem; padding: .75rem; text-align: center; font-weight: 600;
+         background: #1e7a3c; color: #fff; border-radius: .4rem; text-decoration: none; }
+  @media (prefers-color-scheme: dark) {
+    .note { background: #1c2a1c; border-color: #33512f; color: #cfe3cf; }
+    pre { background: #1e1e1e; } .sub { color: #aaa; }
+  }
+</style>
+</head>
+<body>
+<h1>大學現金流量表勾稽底稿產生器</h1>
+<p class="sub">上傳預計平衡表與現金流量預計表，產生總表 + 47 校明細的勾稽底稿。</p>
+
+<div class="note">
+  🔒 <strong>檔案不會上傳到任何伺服器。</strong>整個程式在你的瀏覽器裡跑（Pyodide），
+  來源檔與產出檔都只存在這台電腦的記憶體裡。第一次開啟要下載約 10MB 的 Python 執行環境。
+</div>
+
+<label for="bal">12.平衡（預計平衡表）</label>
+<input id="bal" type="file" accept=".xlsx,.xls" />
+
+<label for="cf">3.現流（現金流量預計表）</label>
+<input id="cf" type="file" accept=".xlsx,.xls" />
+
+<label for="year">年度（留空＝依來源檔標題自動判斷）</label>
+<input id="year" type="text" inputmode="numeric" placeholder="例如 115" />
+
+<button id="go" disabled>載入執行環境中…</button>
+<div id="dl"></div>
+<pre id="log">準備中…</pre>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const log = (msg) => { $("log").textContent = msg; };
+let pyodide;
+
+async function boot() {
+  try {
+    log("下載 Python 執行環境…");
+    pyodide = await loadPyodide();
+    log("安裝 openpyxl…");
+    await pyodide.loadPackage("micropip");
+    await pyodide.runPythonAsync(`
+import micropip
+await micropip.install("openpyxl")
+`);
+    log("載入程式與範本…");
+    await pyodide.runPythonAsync(`
+from pyodide.http import pyfetch
+for name in ("build_gouji.py", "template.xlsx.mirror.json"):
+    open(name, "w").write(await (await pyfetch(name)).string())
+open("template.xlsx", "wb").write(await (await pyfetch("template.xlsx")).bytes())
+`);
+    $("go").disabled = false;
+    $("go").textContent = "產生勾稽底稿";
+    log("就緒。選好兩份來源檔後按上面的按鈕。");
+  } catch (e) {
+    log("初始化失敗：\n" + e);
+  }
+}
+
+async function toFS(input, name) {
+  const f = input.files[0];
+  pyodide.FS.writeFile(name, new Uint8Array(await f.arrayBuffer()));
+}
+
+async function run() {
+  if (!$("bal").files[0] || !$("cf").files[0]) { log("兩份來源檔都要選。"); return; }
+  $("go").disabled = true;
+  $("go").textContent = "產生中…";
+  $("dl").innerHTML = "";
+  log("讀取來源檔…");
+  try {
+    await toFS($("bal"), "balance.xlsx");
+    await toFS($("cf"), "cashflow.xlsx");
+    log("產生中，約需 10–60 秒…");
+    pyodide.globals.set("_year", $("year").value.trim());
+    const t0 = performance.now();
+    const res = await pyodide.runPythonAsync(`
+import build_gouji
+try:
+    out, report = build_gouji.build("balance.xlsx", "cashflow.xlsx", "template.xlsx",
+                                    year=int(_year) if _year else None)
+    _res = (out, report, open(out, "rb").read())
+except build_gouji.BuildError as e:
+    _res = (None, "✗ " + str(e), b"")
+_res
+`);
+    const [name, report, data] = res.toJs();
+    res.destroy();
+    log(report + `\n\n（耗時 ${((performance.now() - t0) / 1000).toFixed(1)} 秒）`);
+    if (name) {
+      const url = URL.createObjectURL(new Blob([data],
+        { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+      const a = document.createElement("a");
+      a.href = url; a.download = name; a.className = "dl";
+      a.textContent = "⬇ 下載 " + name;
+      $("dl").appendChild(a);
+      a.click();
+    }
+  } catch (e) {
+    log("產生失敗：\n" + e);
+  }
+  $("go").disabled = false;
+  $("go").textContent = "產生勾稽底稿";
+}
+
+$("go").addEventListener("click", run);
+boot();
+</script>
+</body>
+</html>
