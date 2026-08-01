@@ -33,7 +33,6 @@ BLOCK_LAST_COL = TOTAL_COL + N_UNI   # 49 = AW
 
 # 五個資料區塊的順序（範本與產出一致）
 BLOCK_NAMES = ["本年資產", "本年負債淨值", "上年資產", "上年負債淨值", "現流"]
-HEADER_LABELS = ("科目", "項      目")
 
 
 # --------------------------------------------------------------------------
@@ -127,7 +126,8 @@ def scan_blocks(ws):
         raise BuildError(f"{ws.title}: 掃到 {len(headers)} 個資料區塊，預期 {len(BLOCK_NAMES)} 個")
     blocks = {}
     for i, h in enumerate(headers):
-        limit = headers[i + 1] if i + 1 < len(headers) else ws.max_row + 1
+        # 下一個區塊的表頭列前面是它的標示列（如「115(本年度)」），不屬於本區塊
+        limit = headers[i + 1] - 1 if i + 1 < len(headers) else ws.max_row + 1
         end = h
         for r in range(h + 1, limit):
             if isinstance(ws.cell(r, 1).value, str) and ws.cell(r, 1).value.strip():
@@ -267,21 +267,23 @@ def build_rowmap(old_blocks, new_blocks, old_ws, new_rows_by_block):
     return rowmap, blockmap
 
 
-def rewrite(formula, rowmap, blockmap, new_blocks, prefix):
+def rewrite(formula, rowmap, blockmap, new_blocks, prefix, skel_rows=SKEL_ROWS):
     """把公式裡指向資料區塊的參照改成新位置（必要時加上總表前綴）。"""
     if not isinstance(formula, str) or not formula.startswith("="):
-        return formula, True
+        return formula, True, set()
 
     ok = True
+    unresolved = set()
 
     def fix_range(m):
         nonlocal ok
         r1 = int(m.group(2))
-        if r1 <= SKEL_ROWS:
+        if r1 <= skel_rows:
             return m.group(0)
         name = blockmap.get(r1)
         if name is None:
             ok = False
+            unresolved.add(r1)
             return m.group(0)
         nb = new_blocks[name]
         return (f"{prefix}$A${nb.start}:${get_column_letter(BLOCK_LAST_COL)}${nb.end}")
@@ -291,16 +293,17 @@ def rewrite(formula, rowmap, blockmap, new_blocks, prefix):
     def fix_cell(m):
         nonlocal ok
         row = int(m.group(4))
-        if row <= SKEL_ROWS:
+        if row <= skel_rows:
             return m.group(0)
         new = rowmap.get(row)
         if new is None:
             ok = False
+            unresolved.add(row)
             return m.group(0)
         return f"{prefix}${m.group(2)}${new}"
 
     out = CELL_RE.sub(fix_cell, out)
-    return out, ok
+    return out, ok, unresolved
 
 
 # --------------------------------------------------------------------------
@@ -406,7 +409,8 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
 
     old_total_blocks = scan_blocks(wbv[TOTAL_SHEET])
     mirror = load_mirror(args.template, wb[detail_names[0]])
-    num_fmt = wb[TOTAL_SHEET].cell(old_total_blocks["本年資產"].start, TOTAL_COL).number_format
+    num_fmt = {name: wb[TOTAL_SHEET].cell(b.start, TOTAL_COL).number_format
+               for name, b in old_total_blocks.items()}
 
     tpl, drift = modal_template(wb, detail_names)
 
@@ -439,10 +443,13 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
             ws.merge_cells(str(mc))
         for (r, c), v in sorted(tpl.items(), reverse=True):
             v = shift_local_rows(v, DETAIL_SHIFT)
-            new, ok = rewrite(v, rowmap_detail, blockmap_detail, new_blocks,
-                              f"'{TOTAL_SHEET}'!")
-            if not ok:                       # 指向舊區塊位置的殘留公式，清空
-                failed.append((name, r, c, v))
+            new, ok, unresolved = rewrite(v, rowmap_detail, blockmap_detail, new_blocks,
+                                          f"'{TOTAL_SHEET}'!", SKEL_ROWS + DETAIL_SHIFT)
+            if not ok:                       # 對不到新區塊位置，只能清空
+                skel = SKEL_ROWS + DETAIL_SHIFT
+                stale = (not (unresolved & set(blockmap_detail))
+                         and min(unresolved) > skel)
+                failed.append((name, r + DETAIL_SHIFT if r > FROZEN_ROWS else r, c, v, stale))
                 new = None
             put(ws, r + (DETAIL_SHIFT if r > FROZEN_ROWS else 0), c, new)
         for c in range(1, SKEL_COLS + 4):                 # 借總表的欄位說明填新空列
@@ -464,9 +471,11 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     for r in range(1, SKEL_ROWS + 1):
         for c in range(1, SKEL_COLS + 4):
             v = wt.cell(r, c).value
-            new, ok = rewrite(v, rowmap_total, blockmap_total, new_blocks, "")
+            new, ok, unresolved = rewrite(v, rowmap_total, blockmap_total, new_blocks, "")
             if not ok:
-                failed.append((TOTAL_SHEET, r, c, v))
+                stale = (not (unresolved & set(blockmap_total))
+                         and min(unresolved) > SKEL_ROWS)
+                failed.append((TOTAL_SHEET, r, c, v, stale))
                 new = None
             if new != v:
                 put(wt, r, c, new)
@@ -492,7 +501,7 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
         b = new_blocks[name]
         head = "項      目" if name == "現流" else "科目"
         write_block(wt, b.header - 1, b.header, markers[name], head,
-                    unis_cur, new_data[name], num_fmt)
+                    unis_cur, new_data[name], num_fmt[name])
 
     # ---- 報告 ----
     report(f"資料區塊（總表）：")
@@ -518,10 +527,24 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
         for old, new in renamed:
             report(f"  {old}  →  {new}")
     if failed:
-        cells = sorted({f"{get_column_letter(c)}{r}" for _, r, c, _ in failed},
-                       key=lambda s: (s[0], int(s[1:])))
-        report(f"\n已清除 {len(failed)} 個指向舊資料區塊的殘留公式："
-              f"{'、'.join(cells)}（範本裡本來就是 #REF! 之類的斷鏈）")
+        broken = [f for f in failed if "#REF!" in str(f[3])]
+        stale = [f for f in failed if "#REF!" not in str(f[3]) and f[4]]
+        lost = [f for f in failed if "#REF!" not in str(f[3]) and not f[4]]
+
+        def cells(items):
+            return "、".join(sorted({f"{get_column_letter(c)}{r}" for _, r, c, *_ in items},
+                                   key=lambda s: (s[0], int(s[1:]))))
+
+        report(f"\n已清空 {len(failed)} 個公式（座標為產出檔）：")
+        if broken:
+            report(f"  範本裡本來就是 #REF! 斷鏈：{cells(broken)}（{len(broken)} 格）")
+        if stale:
+            report(f"  指向明細表已移除的舊鏡射區、新版沒有對應位置：{cells(stale)}（{len(stale)} 格）")
+        if lost:
+            report(f"  ! 對不到位置且不在舊鏡射區，可能是來源資料變動或邊界判斷有誤："
+                   f"{cells(lost)}（{len(lost)} 格）")
+            for name, r, c, v, _ in lost[:5]:
+                report(f"      {name} {get_column_letter(c)}{r}: {v}")
 
     CHECK_COLS = range(14, SKEL_COLS + 1)          # N~R：檢查欄，各表擺放位置本就不一
     ties = [(r, c, mc) for r, c, mc in drift

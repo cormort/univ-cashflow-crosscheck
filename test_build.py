@@ -4,8 +4,10 @@
 
 用法：python3 test_build.py 大學115現金流量表勾稽檔-47所大學.xlsx 大學116現金流量表勾稽檔-47所大學.xlsx
 """
+import pathlib
 import re
 import sys
+import tempfile
 
 import openpyxl
 
@@ -40,6 +42,7 @@ def main():
     wb = openpyxl.load_workbook(out_path)                 # 公式
     wbd = openpyxl.load_workbook(out_path, data_only=True)  # 我們自己寫進去的字面值
     ref = openpyxl.load_workbook(ref_path, data_only=True)
+    ref_f = openpyxl.load_workbook(ref_path)   # 同一份，要讀公式字串而非快取值
 
     total = wbd[TOTAL_SHEET]
     names = [n for n in wb.sheetnames if n not in (NOTE_SHEET, TOTAL_SHEET)]
@@ -122,6 +125,21 @@ def main():
     assert bad_align == 0, "各校表與總表的科目列未對齊"
     assert off == 0, "總表的跨表加總沒有指到同一列"
     print("✓ 47 張明細表與總表逐列對齊，總表跨表加總全部指同一列")
+
+    # 「有效公式被靜默清空」沒辦法靠比對參考檔抓：參考檔 47 張表本來就互不一致，
+    # 「被眾數統一掉」和「被錯誤清空」在它面前長得一樣。能分辨的只有建置器自己。
+    import build_gouji
+    srcs = [pathlib.Path(f) for f in ("12.平衡0814.xlsx", "3.現流0814.xlsx")]
+    if all(f.exists() for f in srcs):
+        _, text = build_gouji.build(str(srcs[0]), str(srcs[1]), "template.xlsx",
+                                    output=str(pathlib.Path(tempfile.mkdtemp()) / "t.xlsx"))
+        bad_lines = [l for l in text.splitlines() if "可能是來源資料變動或邊界判斷有誤" in l]
+        for l in bad_lines:
+            print("  " + l.strip())
+        assert not bad_lines, "建置時有原本有效的公式被清空"
+        print("✓ 建置過程沒有清掉任何原本有效的公式")
+    else:
+        print("· 略過清空檢查（找不到來源檔）")
 
 
 if __name__ == "__main__":
