@@ -104,30 +104,36 @@ async function run() {
   try {
     await toFS($("bal"), "balance.xlsx");
     await toFS($("cf"), "cashflow.xlsx");
-    log("產生中，約需 10–60 秒…");
+    $("dl").innerHTML = "";
+    log("產生中（繼承版＋空白版兩份），約需 20–120 秒…");
     pyodide.globals.set("_year", $("year").value.trim());
     const t0 = performance.now();
     const res = await pyodide.runPythonAsync(`
 import build_gouji
+_y = int(_year) if _year else None
 try:
-    out, report = build_gouji.build("balance.xlsx", "cashflow.xlsx", "template.xlsx",
-                                    year=int(_year) if _year else None)
-    _res = (out, report, open(out, "rb").read())
+    out, report = build_gouji.build("balance.xlsx", "cashflow.xlsx", "template.xlsx", year=_y)
+    blank, _ = build_gouji.build("balance.xlsx", "cashflow.xlsx", "template.xlsx",
+                                 year=_y, blank=True)
+    _res = (out, report, open(out, "rb").read(), blank, open(blank, "rb").read())
 except build_gouji.BuildError as e:
-    _res = (None, "✗ " + str(e), b"")
+    _res = (None, "✗ " + str(e), b"", None, b"")
 _res
 `);
-    const [name, report, data] = res.toJs();
+    const [name, report, data, blankName, blankData] = res.toJs();
     res.destroy();
     log(report + `\n\n（耗時 ${((performance.now() - t0) / 1000).toFixed(1)} 秒）`);
     if (name) {
-      const url = URL.createObjectURL(new Blob([data],
-        { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
-      const a = document.createElement("a");
-      a.href = url; a.download = name; a.className = "dl";
-      a.textContent = "⬇ 下載 " + name;
-      $("dl").appendChild(a);
-      a.click();
+      const link = (n, d, text) => {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(new Blob([d],
+          { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+        a.download = n; a.className = "dl"; a.textContent = text + n;
+        $("dl").appendChild(a);
+        return a;
+      };
+      link(name, data, "⬇ 繼承版（沿用歷年調整對應）").click();
+      link(blankName, blankData, "⬇ 空白版（調整欄留白）");
     }
   } catch (e) {
     log("產生失敗：\n" + e);

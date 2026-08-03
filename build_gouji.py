@@ -359,6 +359,10 @@ def fresh_cashflow(row, label, block_row, prefix):
 
 # 檢查欄是純機械公式，一律指自己這一列
 CHECK_COLS = {13: ("L", "G"), 15: ("L", "B"), 16: ("J", "K"), 17: ("D", "F")}
+# 空白版要清掉的欄：C/E 借貸代號、D/F 調整金額、I 現流側代號——只有這五欄是人工判斷。
+# K（由代號反算）不清：代號清空後它自然算 0，填代號時會自己亮起來，
+# 而且裡面的 SUM 彙總編碼了現流的層級結構，手工重建很痛苦。
+BLANK_COLS = (3, 4, 5, 6, 9)
 VLOOKUP_KEY_RE = re.compile(r"^=VLOOKUP\(A(\d+),")
 
 
@@ -557,7 +561,7 @@ DEFAULT_TEMPLATE = "template.xlsx"
 
 
 def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
-          bal_sheet=None, prev_sheet=None, cf_sheet=None, outdir="."):
+          bal_sheet=None, prev_sheet=None, cf_sheet=None, outdir=".", blank=False):
     """產生勾稽底稿，回傳 (輸出路徑, 報告文字)。"""
     lines = []
     def report(*a):
@@ -574,6 +578,7 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     ws_cur = wb_bal[args.bal_sheet] if args.bal_sheet else pick_sheet(wb_bal, tag="1.本年預算數")
     ws_prev = wb_bal[args.prev_sheet] if args.prev_sheet else pick_sheet(wb_bal, tag="5.上年調整後預算數")
     ws_cfd = wb_cf[args.cf_sheet] if args.cf_sheet else pick_sheet(wb_cf, detail=True)
+    report(f"版本：{'空白版（調整欄留白待填）' if blank else '繼承版（沿用範本累積的調整對應）'}")
     report(f"來源工作表：本年={ws_cur.title}　上年={ws_prev.title}　現流={ws_cfd.title}\n")
 
     evidence, parsed = parse_year(ws_cur, ws_cfd)
@@ -702,6 +707,9 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
         檢查欄一律重新生成——範本歪掉的本來就不該沿用，所以也不在意 rewrite
         有沒有對到位置；B／L 的 VLOOKUP 查找值拉回本列。
         """
+        # 只清骨架本體：K1 是校序號、第 5 列是「借方／貸方」欄位標題，都得留著
+        if blank and col in BLANK_COLS and row >= SKEL_START + DETAIL_SHIFT:
+            return None, True
         if not isinstance(orig, str) or not orig.startswith("="):
             return new, ok
         if col in CHECK_COLS:
@@ -903,7 +911,8 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     report(f"（另有 N~R 檢查欄 {n_check} 格各表擺法不一，已統一為眾數）")
 
     out = args.output or str(
-        pathlib.Path(outdir) / f"大學{year}現金流量表勾稽檔-{N_UNI}所大學.xlsx")
+        pathlib.Path(outdir)
+        / f"大學{year}現金流量表勾稽檔-{N_UNI}所大學{'-空白' if blank else ''}.xlsx")
     wb.save(out)
     report(f"\n✓ 已寫出 {pathlib.Path(out).name}")
     return out, "\n".join(lines)
@@ -917,6 +926,8 @@ def main():
     ap.add_argument("-o", "--output")
     ap.add_argument("--year", type=int, help="覆寫解析到的年度")
     ap.add_argument("--bal-sheet"), ap.add_argument("--prev-sheet"), ap.add_argument("--cf-sheet")
+    ap.add_argument("--blank", action="store_true",
+                    help="空白版：清掉範本累積的借貸代號與調整公式，只留科目與機械公式")
     ap.add_argument("--strip-template", metavar="OUT",
                     help="把範本瘦身成只留骨架的 OUT（另存 OUT.mirror.json），不做其他事")
     args = ap.parse_args()
@@ -925,7 +936,8 @@ def main():
         return
     try:
         _, text = build(args.balance, args.cashflow, args.template, args.output,
-                        args.year, args.bal_sheet, args.prev_sheet, args.cf_sheet)
+                        args.year, args.bal_sheet, args.prev_sheet, args.cf_sheet,
+                        blank=args.blank)
     except BuildError as e:
         raise SystemExit(f"✗ {e}")
     print(text)
