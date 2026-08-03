@@ -78,7 +78,8 @@ await micropip.install("openpyxl")
     log("載入程式與範本…");
     await pyodide.runPythonAsync(`
 from pyodide.http import pyfetch
-for name in ("build_gouji.py", "template.xlsx.mirror.json"):
+for name in ("build_gouji.py", "template.xlsx.mirror.json",
+             "現流代號主檔.json", "勾稽配對表.json"):
     open(name, "w").write(await (await pyfetch(name)).string())
 open("template.xlsx", "wb").write(await (await pyfetch("template.xlsx")).bytes())
 `);

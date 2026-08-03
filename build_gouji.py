@@ -405,6 +405,40 @@ def fix_lookup_key(formula, row, is_head):
     return VLOOKUP_KEY_RE.sub(f"=VLOOKUP(A{row},", formula, count=1)
 
 
+MASTER_FILE = "現流代號主檔.json"      # 由艾富公版產生：現流項目 → 代號
+PAIRING_FILE = "勾稽配對表.json"       # 累積的專業判斷：平衡表科目調整 → 現流項目
+OLD_CODE_COL = 22                      # V 欄：舊代號對照（換制第一年並存用）
+
+
+def load_codebook():
+    """讀代號主檔與配對表；缺檔就回 None，代表沿用範本原有代號。"""
+    try:
+        master = json.loads(pathlib.Path(MASTER_FILE).read_text())
+        pairing = json.loads(pathlib.Path(PAIRING_FILE).read_text())
+    except FileNotFoundError:
+        return None
+    by_name = collections.defaultdict(list)
+    for key in master["代號"]:
+        by_name[key.split("\t")[1]].append(key)
+    return {
+        "code": master["代號"],
+        "nocash": master.get("無現流對應", {}),
+        # 名稱全域唯一時可直接認：範本 H 欄的縮排有幾處是壞的，父項會查不到
+        "unique": {n: v[0] for n, v in by_name.items() if len(v) == 1},
+        "pair": pairing["配對"],
+        "pair_nocash": pairing.get("無現流對應", {}),
+    }
+
+
+def lookup_code(book, parent, name):
+    """(父項, 項目) 精確命中；否則名稱全域唯一時採用；再否則放棄（不猜）。"""
+    hit = book["code"].get(f"{parent}\t{name}")
+    if hit:
+        return hit, None
+    key = book["unique"].get(name)
+    return (book["code"][key], None) if key else (None, f"{parent} › {name}")
+
+
 CF_START_RE = re.compile(r"^([A-Z]+)(\d+)")
 CF_ANCHOR_RE = re.compile(r"^\$K(\d+)$")
 
@@ -460,6 +494,7 @@ def add_mismatch_summary(wt, sheets, header_row, lo, hi):
     看到的是 47 校加總後的差異——甲校 +100、乙校 -100 會互相抵消，
     總表顯示 0，個別學校的不一致就藏起來了。這兩欄把名字直接列出來。
     """
+    put(wt, header_row, OLD_CODE_COL, "V欄=換制前的舊代號，供與歷年底稿對照（下一年度可移除）")
     for col, src, title in SUMMARY_COLS:
         put(wt, header_row, col, title)
         letter = get_column_letter(src)
@@ -718,6 +753,51 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     rows_h, map_h, end_h = place(plan_h)
     n_skel = max(end_a, end_h)
 
+    # ---- 代號：I 欄查主檔、C/E 欄查配對表 ----
+    book = None if blank else load_codebook()
+    cf_parent, cf_leaf, stack = {}, {}, []
+    for i, lb in enumerate(cf_labels):
+        d = indent(lb)
+        del stack[d:]
+        while len(stack) < d:
+            stack.append("")
+        stack.append(str(lb).strip())
+        cf_parent[i] = next((x for x in reversed(stack[:-1]) if x), "")
+        # 群組列與 ▼ 小計列不給代號，只有葉節點才有
+        nxt = indent(cf_labels[i + 1]) if i + 1 < len(cf_labels) else -1
+        cf_leaf[i] = nxt <= d and not str(lb).strip().startswith("▼")
+
+    code_i, code_ce, no_code = {}, {}, []
+    if book:
+        for p in rows_h:                       # I 欄：現流項目 → 主檔代號
+            if not p.head or not cf_leaf[p.key]:
+                continue
+            code, miss = lookup_code(book, cf_parent[p.key], str(p.label).strip())
+            if code:
+                code_i[p.row] = code
+            elif miss:
+                no_code.append(("I", p.row, miss))
+        seen, owner = collections.Counter(), None   # C/E 欄：走樣板列序，與配對表的第N筆一致
+        for r in range(SKEL_START, SKEL_ROWS + 1):
+            a = tpl.get((r, 1))
+            if isinstance(a, str) and a.strip() not in ("", "0"):
+                owner = a.strip()
+            for col, side in ((3, "借"), (5, "貸")):
+                v = tpl.get((r, col))
+                if v in (None, "") or (isinstance(v, str) and v.startswith("=")):
+                    continue
+                seen[(owner, side)] += 1
+                key = f"{owner}\t{side}\t{seen[(owner, side)]}"
+                hit = (book["pair_nocash"].get(key)
+                       or book["code"].get(book["pair"].get(key, "")))
+                if r not in map_a:
+                    continue                       # 該列今年不存在，代號自然也不需要
+                if hit:
+                    code_ce[(map_a[r], col)] = hit  # 鍵用產出的骨架列，不是樣板列
+                else:
+                    no_code.append((get_column_letter(col), map_a[r],
+                                    key.replace("\t", " ")))
+
     # ---- 新區塊配置（全部寫在總表；總表的骨架比明細樣板低 DETAIL_SHIFT 列）----
     new_blocks, cursor = {}, n_skel + DETAIL_SHIFT + 1
     for name in BLOCK_NAMES:
@@ -749,6 +829,11 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
                 continue
             r = p.row + shift
             cells = fresh_cashflow(r, p.label, cf_block_row + p.key, prefix)
+            if p.row in code_i:
+                cells[9] = code_i[p.row]                     # I 欄改查主檔
+                old = tpl.get((p.old, 9)) if p.old else None
+                if old not in (None, ""):
+                    cells[OLD_CODE_COL] = f"舊{str(old).strip()}"
             if p.old is not None:
                 # 沿用的列只重寫名稱與 J：J 純粹是「指到本項目在區塊裡的那一列」，
                 # 由名稱直接算比沿用舊列號可靠——範本的 J 是照舊區塊位置寫的，
@@ -774,6 +859,8 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
         # 只清骨架本體：K1 是校序號、第 5 列是「借方／貸方」欄位標題，都得留著
         if blank and col in BLANK_COLS and row >= SKEL_START + DETAIL_SHIFT:
             return None, True
+        if col in (3, 5) and (row - DETAIL_SHIFT, col) in code_ce:
+            return code_ce[(row - DETAIL_SHIFT, col)], True     # 借貸代號改查配對表
         if not isinstance(orig, str) or not orig.startswith("="):
             return new, ok
         if col in CHECK_COLS:
@@ -954,6 +1041,16 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
                 origin = was.get(code)
                 report(f"  {code}（{'、'.join(sorted(hung[code]))}）"
                        + (f" ← 原本對到已移除的「{origin}」" if origin else " ← 範本本來就沒有對應項目"))
+
+    if book:
+        report(f"\n代號：依 {MASTER_FILE} 重新編號（活動別1碼+群2碼+序2碼），"
+               f"I 欄 {len(code_i)} 個、借貸欄 {len(code_ce)} 個；舊代號留在 V 欄對照")
+        if no_code:
+            report(f"  ! 查不到代號的 {len(no_code)} 處（不臆測，請人工指定）：")
+            for col, r, what in no_code[:10]:
+                report(f"      {col}{r + DETAIL_SHIFT}  {what}")
+    elif not blank:
+        report(f"\n（找不到 {MASTER_FILE}／{PAIRING_FILE}，代號沿用範本原有的）")
 
     if realigned:
         report(f"\n總表跨表加總已改為一律指同一列（範本原本跳列的第 "
