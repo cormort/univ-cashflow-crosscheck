@@ -934,6 +934,27 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
                                     key=lambda s: (s[0], int(s[1:]))))
             report(f"  {side}隨移除列一起丟棄的儲存格 {len(drop)} 格：{cells}")
 
+    # 借貸代號的接線：C/E 掛的代號要在 I 欄找得到，K 才收得走那筆調整。
+    # 現流項目被移除時，它的 I 代號跟著消失，掛在 C/E 的那一頭就變成孤兒。
+    if not blank:
+        live = {str(v).strip() for (r, c), v in tpl2.items()
+                if c == 9 and r >= SKEL_START and v not in (None, "")}
+        hung = collections.defaultdict(list)
+        for (r, c), v in tpl2.items():
+            if (c in (3, 5) and r >= SKEL_START          # 第 5 列是「調整項目」欄位標題
+                    and v not in (None, "") and str(v).strip() not in live):
+                hung[str(v).strip()].append(f"{get_column_letter(c)}{r + DETAIL_SHIFT}")
+        was = {str(v).strip(): str(tpl.get((r, 8), "")).strip()
+               for (r, c), v in tpl.items()
+               if c == 9 and r >= SKEL_START and v not in (None, "")
+               and str(v).strip() in hung}
+        if hung:
+            report(f"\n借貸代號沒有對應的現流項目（{len(hung)} 個，該筆調整不會被 K 收走）：")
+            for code in sorted(hung):
+                origin = was.get(code)
+                report(f"  {code}（{'、'.join(sorted(hung[code]))}）"
+                       + (f" ← 原本對到已移除的「{origin}」" if origin else " ← 範本本來就沒有對應項目"))
+
     if realigned:
         report(f"\n總表跨表加總已改為一律指同一列（範本原本跳列的第 "
               f"{'、'.join(str(r) for r in sorted(realigned))} 列已修正）")
