@@ -103,7 +103,44 @@ def main():
                       f"總表 {lo}–{hi} 列查不到")
     print(f"· 查表公式 {n_off} 條 OFFSET、{n_look} 條 VLOOKUP")
 
-    # ---- 3. 明細表與總表逐列對齊；跨表加總指同一列 ----
+    # ---- 3. 條件式格式：蓋滿骨架、47 張表一致、沒有死規則 ----
+    # J≠K、M≠0 的標色就是勾稽差異的視覺呈現，蓋不到的列等於那些列的差異看不見
+    cf_range = re.compile(r"^([A-Z]+)(\d+):([A-Z]+)(\d+)$")
+
+    def cf_of(name):
+        out = {}
+        for cf in wb[name].conditional_formatting:
+            m = cf_range.match(str(cf.sqref))
+            for rule in cf.rules:
+                f = str(rule.formula[0]) if rule.formula else None
+                check("#REF!" not in str(f),
+                      f"{name} {cf.sqref} 的條件式格式比對 #REF!（死規則，永遠不標色）")
+                if m and m.group(1) in ("J", "M"):
+                    out.setdefault(m.group(1), []).append(
+                        (int(m.group(2)), int(m.group(4)), f))
+        return out
+
+    shapes = set()
+    for name in [TOTAL_SHEET] + names:
+        got = cf_of(name)
+        if name != TOTAL_SHEET:
+            shapes.add(tuple(sorted((c, tuple(v)) for c, v in got.items())))
+        for col in ("J", "M"):
+            spans = got.get(col, [])
+            check(len(spans) == 1,
+                  f"{name} {col} 欄條件式格式裂成 {len(spans)} 段，應該只有一段")
+            if spans:
+                lo, hi, f = spans[0]
+                check(hi >= skel_end,
+                      f"{name} {col} 欄條件式格式只蓋到第 {hi} 列，"
+                      f"骨架到第 {skel_end} 列（後面的差異不會標色）")
+                if col == "J":
+                    check(f == f"$K{lo}",
+                          f"{name} J{lo} 起的規則比對 {f}，應為 $K{lo}（差一列整組錯開）")
+    check(len(shapes) == 1, f"47 張明細表的條件式格式有 {len(shapes)} 種形狀，應該一致")
+    print(f"✓ 條件式格式：J≠K／M≠0 蓋滿骨架、47 張表一致、無 #REF! 死規則")
+
+    # ---- 4. 明細表與總表逐列對齊；跨表加總指同一列 ----
     wording = set()
     for name in names:
         ws = wb[name]

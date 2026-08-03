@@ -17,6 +17,7 @@ import re
 import sys
 
 import openpyxl
+import openpyxl.formatting.formatting
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 
@@ -404,6 +405,47 @@ def fix_lookup_key(formula, row, is_head):
     return VLOOKUP_KEY_RE.sub(f"=VLOOKUP(A{row},", formula, count=1)
 
 
+CF_START_RE = re.compile(r"^([A-Z]+)(\d+)")
+CF_ANCHOR_RE = re.compile(r"^\$K(\d+)$")
+
+
+def normalize_conditional_formatting(ws, skel_end):
+    """把勾稽差異的標色統一成一組，並蓋滿整個骨架。
+
+    顏色就是勾稽差異的視覺呈現：J≠K（現流數對不上由調整反算的數）、
+    M≠0（平衡表數對不上調整推出來的數）。範本 47 張表卻有 12 種形狀——
+    J 欄裂成 2~4 段、19 條規則的比對對象是 #REF!（死規則）、M 欄在
+    M94:M96 破一個洞、結尾停在 134~136 列。骨架改成跟著年度來源走之後
+    更蓋不住（113 的骨架有 356 列）。這些漂移等於有些列的差異看不見。
+
+    規則本身 47 張表一致，所以只重建範圍：取錨點列號最小的那條規則，
+    從錨點一路蓋到骨架結尾。範圍起點必須等於規則裡 $K 的列號，
+    差一列整組比對就會錯開。
+    """
+    keep, anchors = [], {}
+    for cf in ws.conditional_formatting:
+        sqref = str(cf.sqref)
+        col = CF_START_RE.match(sqref)
+        col, start = (col.group(1), int(col.group(2))) if col else (None, None)
+        for rule in cf.rules:
+            formula = rule.formula[0] if rule.formula else None
+            if col == "J":
+                m = CF_ANCHOR_RE.match(str(formula))     # 跳過比對對象是 #REF! 的死規則
+                if m and ("J" not in anchors or int(m.group(1)) < anchors["J"][0]):
+                    anchors["J"] = (int(m.group(1)), rule)
+            elif col == "M" and str(formula) == "0":
+                if "M" not in anchors or start < anchors["M"][0]:
+                    anchors["M"] = (start, rule)
+            else:
+                keep.append((sqref, rule))
+
+    ws.conditional_formatting = openpyxl.formatting.formatting.ConditionalFormattingList()
+    for sqref, rule in keep:
+        ws.conditional_formatting.add(sqref, rule)
+    for col, (start, rule) in sorted(anchors.items()):
+        ws.conditional_formatting.add(f"{col}{start}:{col}{skel_end}", rule)
+
+
 def reposition(cells, map_a, map_h):
     """把 {(列, 欄): 值} 搬到新的骨架列號；表頭列不動，被刪掉的列丟棄。
 
@@ -779,6 +821,7 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
         last = n_skel + DETAIL_SHIFT
         if ws.max_row > last:
             ws.delete_rows(last + 1, ws.max_row - last + 1)
+        normalize_conditional_formatting(ws, last)
         base = name.split("-")[0]
         if base != name:
             renamed.append((name, base))
@@ -831,6 +874,7 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     tail = n_skel + DETAIL_SHIFT
     if wt.max_row > tail:
         wt.delete_rows(tail + 1, wt.max_row - tail + 1)
+    normalize_conditional_formatting(wt, tail)
     for name in BLOCK_NAMES:
         b = new_blocks[name]
         head = "項      目" if name == "現流" else "科目"
