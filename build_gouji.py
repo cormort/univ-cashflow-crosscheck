@@ -430,6 +430,62 @@ def load_codebook():
     }
 
 
+CF_SECTIONS = {"▼業務活動之現金流量": 1, "▼投資活動之現金流量": 2,
+               "▼籌資活動之現金流量": 3, "▼不影響現金流量之投資與籌資活動": 4}
+CF_LETTERS = {"本期賸餘（短絀）": "A", "▼現金及約當現金之淨增（淨減）": "B"}
+
+
+def gen_master(src, dst=MASTER_FILE):
+    """由艾富公版科目表重算代號主檔（公版換版時用）。
+
+    活動別 1 碼 + 群 2 碼 + 群內序 2 碼。群 = 該項目的直屬父項，依它在該章節
+    第一次出現的順序編號；只有葉節點給代號，群本身不給。
+    9xxxx（平衡表內部互轉、無現流對應）沿用舊檔，那不在公版裡。
+    """
+    ws = openpyxl.load_workbook(src, data_only=True)["現流表科目"]
+    items = [(r, str(ws.cell(r, 1).value).strip(), indent(ws.cell(r, 1).value))
+             for r in range(5, ws.max_row + 1) if ws.cell(r, 1).value not in (None, "")]
+    stack, parent = [], {}
+    for r, name, d in items:
+        del stack[d:]
+        while len(stack) < d:
+            stack.append(None)
+        stack.append((r, name))
+        parent[r] = next((x for x in reversed(stack[:-1]) if x), None)
+    has_kid = {p[0] for p in parent.values() if p}
+
+    section, group_no, seq, code = None, {}, {}, {}
+    for r, name, d in items:
+        if d == 0 and name in CF_SECTIONS:
+            section = name
+        par = parent[r]
+        key = f"{par[1] if par else ''}\t{name}"
+        if name in CF_LETTERS:
+            code[key] = CF_LETTERS[name]
+        elif r in has_kid or section not in CF_SECTIONS or d == 0:
+            continue                                  # 群、章節、小計列不給代號
+        else:
+            g = (section, par[0] if par else None)
+            if g not in group_no:
+                group_no[g] = sum(1 for k in group_no if k[0] == section) + 1
+            seq[g] = seq.get(g, 0) + 1
+            code[key] = f"{CF_SECTIONS[section]}{group_no[g]:02d}{seq[g]:02d}"
+
+    old = json.loads(pathlib.Path(dst).read_text()) if pathlib.Path(dst).exists() else {}
+    pathlib.Path(dst).write_text(json.dumps(
+        {"_說明": old.get("_說明", "代號=活動別1碼+群2碼+序2碼"),
+         "_來源": pathlib.Path(src).name,
+         "代號": code, "無現流對應": old.get("無現流對應", {})},
+        ensure_ascii=False, indent=0))
+    dup = len(code) - len(set(code.values()))
+    print(f"✓ {dst}：公版 {len(items)} 列 → 代號 {len(code)} 個"
+          f"（重複 {dup} 個）＋ 無現流對應 {len(old.get('無現流對應', {}))} 個")
+    miss = [k for k in json.loads(pathlib.Path(PAIRING_FILE).read_text())["配對"].values()
+            if k not in code] if pathlib.Path(PAIRING_FILE).exists() else []
+    if miss:
+        print(f"! 配對表有 {len(miss)} 筆指到新主檔沒有的項目：{sorted(set(miss))[:5]}")
+
+
 def lookup_code(book, parent, name):
     """(父項, 項目) 精確命中；否則名稱全域唯一時採用；再否則放棄（不猜）。"""
     hit = book["code"].get(f"{parent}\t{name}")
@@ -1116,9 +1172,14 @@ def main():
     ap.add_argument("--bal-sheet"), ap.add_argument("--prev-sheet"), ap.add_argument("--cf-sheet")
     ap.add_argument("--blank", action="store_true",
                     help="空白版：清掉範本累積的借貸代號與調整公式，只留科目與機械公式")
+    ap.add_argument("--master", metavar="公版.xlsx",
+                    help=f"由艾富公版重算 {MASTER_FILE}，不做其他事")
     ap.add_argument("--strip-template", metavar="OUT",
                     help="把範本瘦身成只留骨架的 OUT（另存 OUT.mirror.json），不做其他事")
     args = ap.parse_args()
+    if args.master:
+        gen_master(args.master)
+        return
     if args.strip_template:
         strip_template(args.template, args.strip_template)
         return
