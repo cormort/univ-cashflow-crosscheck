@@ -5,10 +5,11 @@
 總表的骨架比明細樣板低一列，曾經因此整張表的參照多位移一列，靜態檢查
 兩邊都是綠的，重算才噴 #VALUE!。這支就是補那個缺口。
 
-檢查三項（前兩項不過就 exit 1）：
+檢查四項（前三項不過就 exit 1）：
   1. 重算後沒有任何錯誤值（#REF!/#N/A/#VALUE!/…）
   2. 四個檢查欄逐格算對（47 張表）：M = L-G、O = L-B、P = J-K、Q = D-F
-  3. 底稿自帶的平衡列（資產合計 - 負債 - 淨值）：
+  3. 總表 T/U 欄列出的「不一致學校」與逐張表清點的結果相符
+  4. 底稿自帶的平衡列（資產合計 - 負債 - 淨值）：
      B 欄（上年，純從來源查表）必須 47 校全為 0——這是資料有沒有正確搬進去的鐵證；
      G 欄（本年 = 上年 + 調整）只報數不判定，調整分錄本來就要人工填。
 
@@ -23,9 +24,11 @@ import sys
 import tempfile
 
 import openpyxl
+from openpyxl.utils import get_column_letter
 
 TOTAL_SHEET = "大學-自己調整"
 NOTE_SHEET = "筆記"
+SKEL_START = 7          # 產出檔骨架的第一列
 ERRORS = ("#REF!", "#N/A", "#VALUE!", "#DIV/0!", "#NAME?", "#NUM!", "#NULL!")
 BALANCE_RE = re.compile(r"^=([BG])(\d+)-\1(\d+)-\1(\d+)$")
 SOFFICE_PATHS = [
@@ -97,6 +100,21 @@ def check(path, soffice):
             if bad:
                 fails.append(f"{name} 有 {len(bad)} 格不符，例：{bad[:3]}")
             print(f"  {name}（47 張表）：{len(bad)} 格不符" + ("" if bad else "　✓"))
+
+        # 3) 總表的不一致學校清單：對照自己逐張表清點的結果
+        wrong = []
+        for col, src in ((20, 13), (21, 16)):
+            for r in range(SKEL_START, skel_end + 1):
+                if not str(fml[TOTAL_SHEET].cell(r, col).value or "").startswith("="):
+                    continue
+                got = sorted(str(val[TOTAL_SHEET].cell(r, col).value or "").split())
+                want = sorted(n for n in names if abs(num(val[n].cell(r, src).value)) > 0.5)
+                if got != want:
+                    wrong.append(f"{get_column_letter(col)}{r} 列出 {got} 應為 {want}")
+        if wrong:
+            fails.append(f"總表不一致學校清單有 {len(wrong)} 列不符，例：{wrong[:3]}")
+        print(f"  總表不一致學校清單（T/U 欄）：{len(wrong)} 列不符"
+              + ("" if wrong else "　✓"))
 
         # 4) 底稿自帶的平衡列
         spots = [(r, c) for r in range(6, skel_end + 1) for c in (2, 7)

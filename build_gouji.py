@@ -446,6 +446,28 @@ def normalize_conditional_formatting(ws, skel_end):
         ws.conditional_formatting.add(f"{col}{start}:{col}{skel_end}", rule)
 
 
+# 總表列出「哪幾所學校的這一列不一致」的兩欄
+SUMMARY_COLS = (
+    (20, 13, "T欄=這一列 M≠0（自行調整後與教育部平衡表有差異）的學校"),
+    (21, 16, "U欄=這一列 J≠K（現流表與自行調整反算有差異）的學校"),
+)
+
+
+def add_mismatch_summary(wt, sheets, header_row, lo, hi):
+    """在總表逐列列出不一致的學校名稱。
+
+    總表的 K1 = L1+2 而 L1=0，指到資料區塊的「合計」欄，所以總表的 M/P
+    看到的是 47 校加總後的差異——甲校 +100、乙校 -100 會互相抵消，
+    總表顯示 0，個別學校的不一致就藏起來了。這兩欄把名字直接列出來。
+    """
+    for col, src, title in SUMMARY_COLS:
+        put(wt, header_row, col, title)
+        letter = get_column_letter(src)
+        for r in range(lo, hi + 1):
+            terms = "&".join(f"IF('{s}'!{letter}{r}<>0,\"{s} \",\"\")" for s in sheets)
+            put(wt, r, col, f"={terms}")
+
+
 def reposition(cells, map_a, map_h):
     """把 {(列, 欄): 值} 搬到新的骨架列號；表頭列不動，被刪掉的列丟棄。
 
@@ -780,6 +802,7 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     fresh_detail = fresh_cells(f"'{TOTAL_SHEET}'!", DETAIL_SHIFT)
     failed = []
     renamed = []
+    final_titles = []
     for idx, name in enumerate(detail_names, start=1):
         ws = wb[name]
         # openpyxl 的 insert_rows 不會跟著搬合併儲存格，得自己搬
@@ -826,6 +849,7 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
         if base != name:
             renamed.append((name, base))
             ws.title = base
+        final_titles.append(ws.title)
 
     # ---- 總表：骨架重排 + 改寫公式 + 寫入資料區塊 ----
     # 總表的骨架自成一份（它多一列欄位說明，所以整體比明細樣板低 DETAIL_SHIFT 列），
@@ -880,6 +904,8 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
         head = "項      目" if name == "現流" else "科目"
         write_block(wt, b.header - 1, b.header, markers[name], head,
                     unis_cur, new_data[name], num_fmt[name])
+    add_mismatch_summary(wt, final_titles, SKEL_START + DETAIL_SHIFT,
+                         SKEL_START + DETAIL_SHIFT + 1, n_skel + DETAIL_SHIFT)
 
     # ---- 報告 ----
     report(f"資料區塊（總表）：")
