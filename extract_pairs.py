@@ -36,15 +36,24 @@ def indent(s):
 
 
 def skeleton(ws):
-    """骨架範圍：從 H 欄開始有項目，到 A 欄出現資料區塊表頭（或 H 欄用完）為止。"""
+    """骨架範圍：從 H 欄開始有項目，到骨架下方的資料區開始為止。
+
+    骨架下方是什麼隨檔案而異——完成檔是鏡射公式（A 欄 `='大學-自己調整'!A139`）、
+    總表是資料區塊表頭（A 欄 `科目`）。兩種都要擋，否則會把資料區的數字
+    當成借貸代號抽進來。
+    """
     lo = next((r for r in range(1, 40) if ws.cell(r, COL["現流項目"]).value not in (None, "")), None)
     if lo is None:
         raise SystemExit("✗ 這份檔案的第 8 欄沒有現流項目，版面與預期不符")
-    hi = next((r - 2 for r in range(lo + 5, ws.max_row + 1)
-               if str(ws.cell(r, 1).value).strip() in ("科目", "項      目")), None)
-    if hi is None:                       # 沒有資料區塊就用 H 欄最後一列
-        hi = max(r for r in range(lo, ws.max_row + 1)
-                 if ws.cell(r, COL["現流項目"]).value not in (None, ""))
+    hi = ws.max_row
+    for r in range(lo + 5, ws.max_row + 1):
+        a = ws.cell(r, 1).value
+        if isinstance(a, str) and (a.startswith("=") or a.strip() in ("科目", "項      目")):
+            hi = r - 1
+            break
+    while hi > lo and all(ws.cell(hi, c).value in (None, "")
+                          for c in (1, COL["現流項目"])):
+        hi -= 1
     return lo, hi
 
 
@@ -107,15 +116,22 @@ def main():
         print(f"（找不到 {MASTER_FILE}，跳過與公版的比對）")
     else:
         master = json.loads(pathlib.Path(MASTER_FILE).read_text())["代號"]
-        names = {k.split("\t")[1] for k in master}
+        coded = {k.split("\t")[1] for k in master}
+        # 公版裡的群組不編碼，配對指到群組是資料怪異，不是名稱對不上
+        chart = coded | {k.split("\t")[0] for k in master if k.split("\t")[0]}
         got = {p["現流項目"] for p in pairs if p["現流項目"]}
-        hit = got & names
-        print(f"① 名稱與公版的重疊：{len(hit)}/{len(got)}"
-              f"（{100 * len(hit) / max(len(got), 1):.0f}%）"
-              + ("　→ 可直接併" if len(hit) == len(got)
-                 else "　→ 需要名稱對照，不重疊的："))
-        for n in sorted(got - names)[:8]:
-            print(f"      {n[:44]}")
+        hit, group, alien = got & coded, (got & chart) - coded, got - chart
+        print(f"① 名稱與公版的重疊：{len(got & chart)}/{len(got)}"
+              f"（{100 * len(got & chart) / max(len(got), 1):.0f}%）"
+              + ("　→ 可直接併" if not alien else "　→ 需要名稱對照"))
+        for n in sorted(alien)[:8]:
+            print(f"      公版沒有：{n[:40]}")
+        for n in sorted(group)[:5]:
+            print(f"      指到群組（公版不編碼，請確認）：{n[:34]}")
+        bad = sum(1 for p in pairs if not p["現流項目"])
+        if bad:
+            print(f"      另有 {bad} 筆對不到現流項目"
+                  f"（可能是該檔的孤兒代號，或版面與預期不符）")
 
         have = set(json.loads(pathlib.Path(PAIRING_FILE).read_text())["配對"].values()) \
             if pathlib.Path(PAIRING_FILE).exists() else set()
