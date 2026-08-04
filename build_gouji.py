@@ -573,6 +573,7 @@ HELPER_COLS = (14, 18)                 # N=代號檢查、R=還要補哪一邊
 K_RANGE_RE = re.compile(r"^=-SUMIF\(\$C\$(\d+):\$C\$(\d+),")
 DIFF_ROW_RE = re.compile(r"^=D(\d+)-F\1$")
 TOTAL_SUM_RE = re.compile(r"^=SUM\(D(\d+):D(\d+)\)$")
+CASH_CODE = "B"                        # ▼現金及約當現金之淨增（淨減）
 
 
 def align_k_range(ws):
@@ -590,7 +591,7 @@ def align_k_range(ws):
               for r in range(ws.max_row, 1, -1)
               if TOTAL_SUM_RE.match(str(ws.cell(r, 4).value or ""))), None)
     if m is None:
-        return 0
+        return 0, None
     lo, hi = m.group(1), m.group(2)
     n = 0
     for r in range(1, ws.max_row + 1):
@@ -602,7 +603,24 @@ def align_k_range(ws):
         if new != v:
             ws.cell(r, 11).value = new
             n += 1
-    return n
+
+    # 現金那一列的 K 原本是 `=J`（穿透），等於整列沒有勾稽。
+    # 現金的符號慣例跟其他列相反（資產增加記借方，而現金淨增是正值），標準的
+    # `-SUMIF+SUMIF` 會給出反號，範本用 `=J` 迴避，代價是把檢查一起丟掉——
+    # `P = J − K` 恆為 0，而那正是整張表最根本的一條：
+    # 「平衡表的現金變動 ＝ 現流表的最終淨增減」。掛在這個代號上的調整有 94 筆
+    # （47 校各 2 筆），全被丟棄。改成把符號翻過來的 SUMIF。
+    # 實測 47 校此式算出來與 J 完全相等〔實測〕，所以數字不變，只是檢查活過來。
+    cash = None
+    for r in range(1, ws.max_row + 1):
+        if str(ws.cell(r, 9).value or "").strip() != CASH_CODE:
+            continue
+        if not re.fullmatch(rf"=J{r}", str(ws.cell(r, 11).value or "")):
+            continue
+        ws.cell(r, 11).value = (f"=SUMIF($C${lo}:$C${hi},I{r},$D${lo}:$D${hi})"
+                                f"-SUMIF($E${lo}:$E${hi},I{r},$F${lo}:$F${hi})")
+        cash = r
+    return n, cash
 
 
 def flag_debit_credit_gap(ws):
@@ -1085,6 +1103,7 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     dead_cf = []
     n_helper = 0
     n_krange = 0
+    cash_rows = 0
     final_titles = []
     for idx, name in enumerate(detail_names, start=1):
         ws = wb[name]
@@ -1128,7 +1147,9 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
         if ws.max_row > last:
             ws.delete_rows(last + 1, ws.max_row - last + 1)
         dead_cf += normalize_conditional_formatting(ws, last)
-        n_krange += align_k_range(ws)     # 要在 add_helper_columns 之前：N 欄抄的是 K 的範圍
+        _nk, _cash = align_k_range(ws)    # 要在 add_helper_columns 之前：N 欄抄的是 K 的範圍
+        n_krange += _nk
+        cash_rows += 1 if _cash else 0
         n_helper += add_helper_columns(ws, FROZEN_ROWS + 4, SKEL_START, last)
         gap_row = flag_debit_credit_gap(ws)
         base = name.split("-")[0]
@@ -1185,7 +1206,9 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     if wt.max_row > tail:
         wt.delete_rows(tail + 1, wt.max_row - tail + 1)
     dead_cf += normalize_conditional_formatting(wt, tail)
-    n_krange += align_k_range(wt)
+    _nk, _cash = align_k_range(wt)
+    n_krange += _nk
+    cash_rows += 1 if _cash else 0
     add_helper_columns(wt, SKEL_START + DETAIL_SHIFT, SKEL_START + DETAIL_SHIFT, tail)
     gap_row = flag_debit_credit_gap(wt)
     for name in BLOCK_NAMES:
@@ -1321,6 +1344,10 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
         report(f"\nK 的 SUMIF 範圍已對齊借貸總計的加總範圍（改寫 {n_krange} 格）——"
                f"範本原本總表 $C$7:$C$127、明細 $C$8:$C$128，各有一列的破口；"
                f"掉進破口的調整不會被 K 收走，而 P=J−K 仍是 0")
+    if cash_rows:
+        report(f"現金那一列的 K 由 `=J`（穿透，P 恆為 0 等於沒勾稽）改為翻號的 SUMIF"
+               f"（{cash_rows} 張表）——掛在代號 {CASH_CODE} 上的調整原本全被丟棄，"
+               f"而那是「平衡表的現金變動 ＝ 現流表的最終淨增減」這條最根本的勾稽")
     if gap_row:
         report(f"借貸差（第 {gap_row} 列）已加標題與紅底標色——"
                f"那是「有調整沒被 K 收走」的最後一道防線，原本沒有任何提示")
