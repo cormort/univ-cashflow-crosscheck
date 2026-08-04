@@ -1327,16 +1327,25 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     # 標色是勾稽的訊號：J≠K、M≠0 由條件式格式標出來。範本累積的手工底色會混進去
     # 變成假訊號——實測 J11／J33 就有零星的黃底掛在 J 欄，長得跟「這格對不上」一樣。
     # 條件式格式不受影響（那是規則，不是儲存格填色）。
+    # 順帶清掉儲存格註解：範本累積的是**上個年度的個案筆記**（「中正19303 嘉義16170」
+    # 這種），每年被原封不動複製到產出檔，數字早就不適用了，還掛著具名作者。
     n_fill = collections.Counter()
+    n_note = collections.Counter()
     for ws in wb.worksheets:
         for row in ws.iter_rows():
             for c in row:
                 if c.fill is not None and c.fill.patternType:
                     n_fill[ws.title] += 1
                     c.fill = PatternFill()
+                if c.comment is not None:
+                    n_note[ws.title] += 1
+                    c.comment = None
     if n_fill:
         report(f"\n已清掉靜態底色 {sum(n_fill.values())} 格"
                f"（{len(n_fill)} 張表）——標色一律交給條件式格式")
+    if n_note:
+        report(f"已清掉儲存格註解 {sum(n_note.values())} 個"
+               f"（{len(n_note)} 張表）——內容是上個年度的個案筆記，數字已不適用")
     if n_helper:
         report(f"\n已補填表輔助兩欄：N（借貸代號在 I 欄找不到就示警，"
                f"該筆調整不會被 K 收走）、R（依 M 算出還要補借方還是貸方、補多少）")
