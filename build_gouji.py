@@ -567,6 +567,49 @@ def add_mismatch_summary(wt, sheets, header_row, lo, hi):
             put(wt, r, col, f"={terms}")
 
 
+HELPER_COLS = (14, 18)                 # N=代號檢查、R=還要補哪一邊
+K_RANGE_RE = re.compile(r"^=-SUMIF\(\$C\$(\d+):\$C\$(\d+),")
+
+
+def add_helper_columns(ws, header_row, lo, hi):
+    """兩欄填表輔助。都是唯讀的提示，不參與任何既有計算。
+
+    N（代號檢查）：C／E 掛的代號要在 I 欄找得到，K 的 SUMIF 才收得走那筆調整；
+    比不到就**靜靜跳過**，畫面上只看得到一個對不起來的差額，看不出原因。
+    產生報告只抓得到產生當下就存在的孤兒，抓不到之後手動填錯的，所以要一條活的。
+    範圍直接抄 K 自己的 SUMIF 範圍——兩者不一致的話警示就會跟實際收不收得到脫節。
+
+    R（還要補）：M = L − G 只給有號數的差額，但 G 的算式兩側相反
+    （資產 `B+D−F`、負債淨值 `B+F−D`），所以同樣是 M>0，資產要補借方、
+    負債淨值要補貸方。逐格心算容易反向，直接寫成「借 162,231」。
+    """
+    rng = next((K_RANGE_RE.match(str(ws.cell(r, 11).value))
+                for r in range(lo, hi + 1) if K_RANGE_RE.match(str(ws.cell(r, 11).value))), None)
+    if rng is None:
+        return 0                       # 認不出 K 的範圍就不放，寧可沒有也不要範圍錯的提示
+    c_lo, c_hi = rng.group(1), rng.group(2)
+    liab = next((r for r in range(lo, hi + 1)
+                 if str(ws.cell(r, 1).value or "").strip() == "負債"), hi + 1)
+
+    put(ws, header_row, 14, "N欄=借貸代號在 I 欄找不到（該筆調整不會被 K 收走）")
+    put(ws, header_row, 18, "R欄=依 M 算出還要補哪一邊、補多少")
+    n = 0
+    for r in range(lo, hi + 1):
+        # 只放在 K 的 SUMIF 範圍內——那就是能填調整的區間，
+        # 合計列、平衡列落在範圍外，掛提示只是噪音
+        if not int(c_lo) <= r <= int(c_hi):
+            continue
+        put(ws, r, 14,
+            f'=IF(AND(C{r}<>"",COUNTIF($I${c_lo}:$I${c_hi},C{r})=0),"⚠借方代號無對應",'
+            f'IF(AND(E{r}<>"",COUNTIF($I${c_lo}:$I${c_hi},E{r})=0),"⚠貸方代號無對應",""))')
+        n += 1
+        if str(ws.cell(r, 13).value or "").startswith("="):
+            d1, d2 = ("借", "貸") if r < liab else ("貸", "借")
+            put(ws, r, 18,
+                f'=IFERROR(IF(M{r}=0,"",IF(M{r}>0,"{d1} ","{d2} ")&TEXT(ABS(M{r}),"#,##0")),"")')
+    return n
+
+
 def reposition(cells, map_a, map_h):
     """把 {(列, 欄): 值} 搬到新的骨架列號；表頭列不動，被刪掉的列丟棄。
 
@@ -971,6 +1014,7 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     failed = []
     renamed = []
     dead_cf = []
+    n_helper = 0
     final_titles = []
     for idx, name in enumerate(detail_names, start=1):
         ws = wb[name]
@@ -1014,6 +1058,7 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
         if ws.max_row > last:
             ws.delete_rows(last + 1, ws.max_row - last + 1)
         dead_cf += normalize_conditional_formatting(ws, last)
+        n_helper += add_helper_columns(ws, FROZEN_ROWS + 4, SKEL_START, last)
         base = name.split("-")[0]
         if base != name:
             renamed.append((name, base))
@@ -1068,6 +1113,7 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     if wt.max_row > tail:
         wt.delete_rows(tail + 1, wt.max_row - tail + 1)
     dead_cf += normalize_conditional_formatting(wt, tail)
+    add_helper_columns(wt, SKEL_START + DETAIL_SHIFT, SKEL_START + DETAIL_SHIFT, tail)
     for name in BLOCK_NAMES:
         b = new_blocks[name]
         head = "項      目" if name == "現流" else "科目"
@@ -1194,6 +1240,9 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     if n_fill:
         report(f"\n已清掉靜態底色 {sum(n_fill.values())} 格"
                f"（{len(n_fill)} 張表）——標色一律交給條件式格式")
+    if n_helper:
+        report(f"\n已補填表輔助兩欄：N（借貸代號在 I 欄找不到就示警，"
+               f"該筆調整不會被 K 收走）、R（依 M 算出還要補借方還是貸方、補多少）")
     if dead_cf:
         seen = collections.Counter(dead_cf)
         report(f"\n已移除死的條件式格式 {len(dead_cf)} 條"
