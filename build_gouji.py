@@ -18,6 +18,7 @@ import sys
 
 import openpyxl
 import openpyxl.formatting.formatting
+from openpyxl.styles import PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 
@@ -512,13 +513,19 @@ def normalize_conditional_formatting(ws, skel_end):
     從錨點一路蓋到骨架結尾。範圍起點必須等於規則裡 $K 的列號，
     差一列整組比對就會錯開。
     """
-    keep, anchors = [], {}
+    keep, anchors, dead = [], {}, []
     for cf in ws.conditional_formatting:
         sqref = str(cf.sqref)
         col = CF_START_RE.match(sqref)
         col, start = (col.group(1), int(col.group(2))) if col else (None, None)
         for rule in cf.rules:
             formula = rule.formula[0] if rule.formula else None
+            # 整條公式被引號包起來的是死規則：算出來是字串常數，沒有任何活的
+            # 儲存格參照，所以逐列逐年都同一個結果，標不標色都不帶資訊。
+            # 範本的 D8:D15 就是這種（原意應是「C、D 都填了」，早被產生報告取代）。
+            if formula is not None and str(formula).strip().startswith('"'):
+                dead.append((sqref, str(formula)[:60]))
+                continue
             if col == "J":
                 m = CF_ANCHOR_RE.match(str(formula))     # 跳過比對對象是 #REF! 的死規則
                 if m and ("J" not in anchors or int(m.group(1)) < anchors["J"][0]):
@@ -534,6 +541,7 @@ def normalize_conditional_formatting(ws, skel_end):
         ws.conditional_formatting.add(sqref, rule)
     for col, (start, rule) in sorted(anchors.items()):
         ws.conditional_formatting.add(f"{col}{start}:{col}{skel_end}", rule)
+    return dead
 
 
 # 總表列出「哪幾所學校的這一列不一致」的兩欄
@@ -767,6 +775,23 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
 
     cur_a, cur_l = split_sections(rows_cur, ws_cur.title)
     prev_a, prev_l = split_sections(rows_prev, ws_prev.title)
+
+    # 平衡檢定：平衡表本來就該「資產合計 ＝ 負債及淨值合計」，不平衡代表來源本身壞了。
+    # 只報不中止——沒實測過會踩到的情況，不拿沒把握的規則擋掉整次產生。
+    # ponytail: 查的是來源，不是「有沒有正確搬進底稿」；後者要 test_build／test_recalc。
+    for tag, sec_a, sec_l in (("本年", cur_a, cur_l), ("上年", prev_a, prev_l)):
+        av, lv = sec_a[-1][1], sec_l[-1][1]
+        off = [(unis_cur[i - 1], av[i] - lv[i]) for i in range(1, len(unis_cur) + 1)
+               if isinstance(av[i], (int, float)) and isinstance(lv[i], (int, float))
+               and abs(av[i] - lv[i]) > 0.5]
+        if off:
+            report(f"! {tag}來源不平衡（資產合計 ≠ 負債及淨值合計）{len(off)} 校：")
+            for name, d in off[:10]:
+                report(f"   {name} 差 {d:,.0f}")
+        else:
+            report(f"✓ {tag}來源平衡（{len(unis_cur)} 校資產合計＝負債及淨值合計）")
+    report("")
+
     rows_cf = [r for r in rows_cf if r[0] is not None]
     new_data = {
         "本年資產": cur_a, "本年負債淨值": cur_l,
@@ -945,6 +970,7 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     fresh_detail = fresh_cells(f"'{TOTAL_SHEET}'!", DETAIL_SHIFT)
     failed = []
     renamed = []
+    dead_cf = []
     final_titles = []
     for idx, name in enumerate(detail_names, start=1):
         ws = wb[name]
@@ -987,7 +1013,7 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
         last = n_skel + DETAIL_SHIFT
         if ws.max_row > last:
             ws.delete_rows(last + 1, ws.max_row - last + 1)
-        normalize_conditional_formatting(ws, last)
+        dead_cf += normalize_conditional_formatting(ws, last)
         base = name.split("-")[0]
         if base != name:
             renamed.append((name, base))
@@ -1041,7 +1067,7 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     tail = n_skel + DETAIL_SHIFT
     if wt.max_row > tail:
         wt.delete_rows(tail + 1, wt.max_row - tail + 1)
-    normalize_conditional_formatting(wt, tail)
+    dead_cf += normalize_conditional_formatting(wt, tail)
     for name in BLOCK_NAMES:
         b = new_blocks[name]
         head = "項      目" if name == "現流" else "科目"
@@ -1153,6 +1179,27 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
             opts = "　/　".join(f"{str(v)[:32]}×{n}" for v, n in mc)
             report(f"  {get_column_letter(c)}{r}: {opts}")
     report(f"（另有 N~R 檢查欄 {n_check} 格各表擺法不一，已統一為眾數）")
+
+    # ---- 清掉靜態底色 ----
+    # 標色是勾稽的訊號：J≠K、M≠0 由條件式格式標出來。範本累積的手工底色會混進去
+    # 變成假訊號——實測 J11／J33 就有零星的黃底掛在 J 欄，長得跟「這格對不上」一樣。
+    # 條件式格式不受影響（那是規則，不是儲存格填色）。
+    n_fill = collections.Counter()
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for c in row:
+                if c.fill is not None and c.fill.patternType:
+                    n_fill[ws.title] += 1
+                    c.fill = PatternFill()
+    if n_fill:
+        report(f"\n已清掉靜態底色 {sum(n_fill.values())} 格"
+               f"（{len(n_fill)} 張表）——標色一律交給條件式格式")
+    if dead_cf:
+        seen = collections.Counter(dead_cf)
+        report(f"\n已移除死的條件式格式 {len(dead_cf)} 條"
+               f"（公式是字串常數，沒有活的儲存格參照，標色不帶資訊）：")
+        for (sq, formula), n in seen.most_common(5):
+            report(f"  {sq} × {n} 張表　{formula}")
 
     out = args.output or str(
         pathlib.Path(outdir)

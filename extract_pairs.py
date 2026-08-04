@@ -9,21 +9,58 @@
 第 2 種只要求「該檔案內部代號自洽」，不需要跟我們的編碼一致。
 
 用法：python3 extract_pairs.py 別人的勾稽表.xlsx [輸出.csv]
+他機關多半還是 .xls（BIFF8），丟進來會自動用 LibreOffice 轉一份暫存檔。
 """
 import collections
 import csv
 import json
 import pathlib
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 
 import openpyxl
 
+SOFFICE = ("soffice", "/Applications/LibreOffice.app/Contents/MacOS/soffice")
+
+
+def as_xlsx(path):
+    """openpyxl 讀不了 BIFF8，先轉檔。回傳可讀的路徑（.xlsx 原樣奉還）。"""
+    if not str(path).lower().endswith(".xls"):
+        return path
+    exe = next((x for x in SOFFICE if shutil.which(x) or pathlib.Path(x).exists()), None)
+    if exe is None:
+        raise SystemExit("✗ 這是 .xls，需要 LibreOffice 轉檔：brew install --cask libreoffice")
+    tmp = tempfile.mkdtemp(prefix="gouji-xls-")
+    subprocess.run([exe, "--headless", "--convert-to", "xlsx", "--outdir", tmp, str(path)],
+                   check=True, capture_output=True)
+    out = pathlib.Path(tmp) / (pathlib.Path(path).stem + ".xlsx")
+    if not out.exists():
+        raise SystemExit(f"✗ 轉檔失敗，LibreOffice 沒有產出 {out.name}")
+    print(f"（.xls 已轉為暫存 xlsx：{out}）")
+    return out
+
 MASTER_FILE = "現流代號主檔.json"
 PAIRING_FILE = "勾稽配對表.json"
-JREF = re.compile(r"(?<![A-Z$])J(\d+)")
-COL = {"科目": 1, "借代號": 3, "借金額": 4, "貸代號": 5, "貸金額": 6,
-       "現流項目": 8, "現流代號": 9}
+HDR = re.compile(r"業務活動之現金流量")
+COL = {"科目": 1, "借代號": 3, "借金額": 4, "貸代號": 5, "貸金額": 6}
+
+
+def locate(ws):
+    """右半邊現流區塊在第幾欄——不是每份都在 H。
+
+    左半邊的調整欄 C/D/E/F 各家一致，右半邊會被插進去的欄推著走：
+    醫療藥品多一欄「平衡表數」推到 I、高中多「平衡表數＋檢誤」推到 J〔實測〕。
+    認第一節的節名定位，代號與金額固定接在右邊兩欄。
+    """
+    for r in range(1, 20):
+        for c in range(1, 20):
+            v = ws.cell(r, c).value
+            if isinstance(v, str) and HDR.search(v):
+                return {**COL, "現流項目": c, "現流代號": c + 1, "現流數": c + 2}
+    raise SystemExit("✗ 找不到「業務活動之現金流量」，版面與預期不符")
 
 
 def indent(s):
@@ -35,7 +72,7 @@ def indent(s):
     return n
 
 
-def skeleton(ws):
+def skeleton(ws, COL):
     """骨架範圍：從 H 欄開始有項目，到骨架下方的資料區開始為止。
 
     骨架下方是什麼隨檔案而異——完成檔是鏡射公式（A 欄 `='大學-自己調整'!A139`）、
@@ -44,7 +81,7 @@ def skeleton(ws):
     """
     lo = next((r for r in range(1, 40) if ws.cell(r, COL["現流項目"]).value not in (None, "")), None)
     if lo is None:
-        raise SystemExit("✗ 這份檔案的第 8 欄沒有現流項目，版面與預期不符")
+        raise SystemExit(f"✗ 這份檔案的第 {COL['現流項目']} 欄沒有現流項目，版面與預期不符")
     hi = ws.max_row
     for r in range(lo + 5, ws.max_row + 1):
         a = ws.cell(r, 1).value
@@ -58,11 +95,13 @@ def skeleton(ws):
 
 
 def extract(path):
-    wb = openpyxl.load_workbook(path)
-    sheets = [n for n in wb.sheetnames if wb[n].cell(1, COL["現流項目"]).value is not None
-              or wb[n].max_column >= COL["現流代號"]]
-    ws = wb[sheets[0]] if len(wb.sheetnames) < 3 else wb[wb.sheetnames[2]]
-    lo, hi = skeleton(ws)
+    wb = openpyxl.load_workbook(as_xlsx(path))
+    ws = wb[wb.sheetnames[0]] if len(wb.sheetnames) < 3 else wb[wb.sheetnames[2]]
+    COL = locate(ws)
+    # 借貸金額指回現流數那一欄（我們的檔是 J，別人的可能是 K/L）
+    jref = re.compile(r"(?<![A-Z$])%s(\d+)"
+                      % openpyxl.utils.get_column_letter(COL["現流數"]))
+    lo, hi = skeleton(ws, COL)
 
     stack, item, parent = [], {}, {}
     for r in range(lo, hi + 1):
@@ -94,7 +133,7 @@ def extract(path):
             if v in (None, "") or (isinstance(v, str) and v.startswith("=")):
                 continue
             amt = str(ws.cell(r, ac).value or "")
-            j = {int(m.group(1)) for m in JREF.finditer(amt)}
+            j = {int(m.group(1)) for m in jref.finditer(amt)}
             by_f = next(iter(j)) if len(j) == 1 else None
             tgt = by_f if by_f in item else by_code.get(str(v).strip())
             how["公式" if by_f in item else ("代號" if tgt else "無法解析")] += 1
@@ -121,9 +160,10 @@ def main():
         chart = coded | {k.split("\t")[0] for k in master if k.split("\t")[0]}
         got = {p["現流項目"] for p in pairs if p["現流項目"]}
         hit, group, alien = got & coded, (got & chart) - coded, got - chart
+        verdict = "　→ 抽不到現流項目，先確認版面" if not got else (
+            "　→ 可直接併" if not alien else "　→ 需要名稱對照")
         print(f"① 名稱與公版的重疊：{len(got & chart)}/{len(got)}"
-              f"（{100 * len(got & chart) / max(len(got), 1):.0f}%）"
-              + ("　→ 可直接併" if not alien else "　→ 需要名稱對照"))
+              f"（{100 * len(got & chart) / max(len(got), 1):.0f}%）" + verdict)
         for n in sorted(alien)[:8]:
             print(f"      公版沒有：{n[:40]}")
         for n in sorted(group)[:5]:

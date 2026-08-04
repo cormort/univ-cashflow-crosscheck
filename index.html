@@ -78,7 +78,7 @@ await micropip.install("openpyxl")
     log("載入程式與範本…");
     await pyodide.runPythonAsync(`
 from pyodide.http import pyfetch
-for name in ("build_gouji.py", "template.xlsx.mirror.json",
+for name in ("build_gouji.py", "test_build.py", "template.xlsx.mirror.json",
              "現流代號主檔.json", "勾稽配對表.json"):
     open(name, "w").write(await (await pyfetch(name)).string())
 open("template.xlsx", "wb").write(await (await pyfetch("template.xlsx")).bytes())
@@ -106,16 +106,39 @@ async function run() {
     await toFS($("bal"), "balance.xlsx");
     await toFS($("cf"), "cashflow.xlsx");
     $("dl").innerHTML = "";
-    log("產生中（繼承版＋空白版兩份），約需 20–120 秒…");
+    log("產生中（繼承版＋空白版兩份）＋驗收，約需 20–120 秒…");
     pyodide.globals.set("_year", $("year").value.trim());
     const t0 = performance.now();
     const res = await pyodide.runPythonAsync(`
 import build_gouji
+
+def _verify(path):
+    """跑 test_build 的靜態驗收，把它印的東西收成字串。
+
+    test_build 是純 openpyxl，不需要 LibreOffice，所以瀏覽器裡也跑得動。
+    它查的是「查表公式指到的那一列，科目名就是這一列自己的科目名」——
+    也就是資料有沒有正確搬進底稿。至於算出來對不對要 test_recalc，那個
+    得真的重算，瀏覽器裡沒有。
+    """
+    import contextlib, io, sys
+    import test_build
+    buf = io.StringIO()
+    sys.argv = ["test_build.py", path, "balance.xlsx", "cashflow.xlsx"]
+    try:
+        with contextlib.redirect_stdout(buf):
+            test_build.main()
+        return buf.getvalue()
+    except AssertionError as e:
+        return buf.getvalue() + f"\\n✗ {e}"
+    except Exception as e:
+        return buf.getvalue() + f"\\n✗ 驗收本身出錯：{type(e).__name__}: {e}"
+
 _y = int(_year) if _year else None
 try:
     out, report = build_gouji.build("balance.xlsx", "cashflow.xlsx", "template.xlsx", year=_y)
     blank, _ = build_gouji.build("balance.xlsx", "cashflow.xlsx", "template.xlsx",
                                  year=_y, blank=True)
+    report += "\\n\\n──── 驗收：繼承版（靜態檢查，不含重算）────\\n" + _verify(out)
     _res = (out, report, open(out, "rb").read(), blank, open(blank, "rb").read())
 except build_gouji.BuildError as e:
     _res = (None, "✗ " + str(e), b"", None, b"")
