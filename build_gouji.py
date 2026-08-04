@@ -18,6 +18,8 @@ import sys
 
 import openpyxl
 import openpyxl.formatting.formatting
+import openpyxl.formatting.rule
+import openpyxl.styles
 from openpyxl.styles import PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
 
@@ -569,6 +571,68 @@ def add_mismatch_summary(wt, sheets, header_row, lo, hi):
 
 HELPER_COLS = (14, 18)                 # N=代號檢查、R=還要補哪一邊
 K_RANGE_RE = re.compile(r"^=-SUMIF\(\$C\$(\d+):\$C\$(\d+),")
+DIFF_ROW_RE = re.compile(r"^=D(\d+)-F\1$")
+TOTAL_SUM_RE = re.compile(r"^=SUM\(D(\d+):D(\d+)\)$")
+
+
+def align_k_range(ws):
+    """把 K 的 SUMIF 範圍對齊到「借貸總計」的加總範圍。
+
+    範本繼承下來的範圍兩張表不一致：總表 `$C$7:$C$127`、明細 `$C$8:$C$128`，
+    但兩者骨架逐列對齊（`資產` 都在第 7 列），所以必有一邊有洞。總表漏第 128
+    列、明細漏第 7 列。掉進洞裡的調整**不會被 K 收走，而 `P = J − K` 仍是 0**，
+    勾稽顯示通過〔實測〕。
+
+    對齊到借貸總計的範圍，是為了讓一條不變量成立：**借貸差 = 0 且代號都對得上
+    ⇒ 沒有任何調整被漏掉**。兩個範圍一致，這句話才是真的。
+    """
+    m = next((TOTAL_SUM_RE.match(str(ws.cell(r, 4).value or ""))
+              for r in range(ws.max_row, 1, -1)
+              if TOTAL_SUM_RE.match(str(ws.cell(r, 4).value or ""))), None)
+    if m is None:
+        return 0
+    lo, hi = m.group(1), m.group(2)
+    n = 0
+    for r in range(1, ws.max_row + 1):
+        v = ws.cell(r, 11).value
+        if not isinstance(v, str) or "SUMIF" not in v:
+            continue
+        new = re.sub(r"\$([CDEF])\$\d+:\$([CDEF])\$\d+",
+                     lambda x: f"${x.group(1)}${lo}:${x.group(2)}${hi}", v)
+        if new != v:
+            ws.cell(r, 11).value = new
+            n += 1
+    return n
+
+
+def flag_debit_credit_gap(ws):
+    """把「借貸差」這一列標出來——它是唯一擋得住『調整掉到 K 範圍外』的防線。
+
+    實測：在 K 的 SUMIF 範圍外填一筆合法調整（代號對得上、金額正常），
+    目標現流列的 K 完全沒收到，`P = J − K` 仍然是 0——**勾稽顯示通過**，
+    M 也沒動，N 欄在那一列根本沒有公式。整張表只有借貸差從 0 變成該金額。
+
+    偏偏借貸差沒有標題也沒有標色，還落在骨架下方；文件又教使用者「J≠K 與
+    M≠0 都不標色就是過了」。等於唯一的證據放在沒人會看的地方。
+    """
+    row = next((r for r in range(ws.max_row, 1, -1)
+                if DIFF_ROW_RE.match(str(ws.cell(r, 4).value or ""))), None)
+    if row is None:                      # 總表沒有這一列，補在借貸總計的下一列
+        tot = next((r for r in range(ws.max_row, 1, -1)
+                    if str(ws.cell(r, 4).value or "").startswith("=SUM(D")), None)
+        if tot is None or ws.cell(tot + 1, 4).value not in (None, ""):
+            return None
+        row = tot + 1
+        put(ws, row, 4, f"=D{tot}-F{tot}")
+        put(ws, row, 6, f"=F{tot}-D{tot}")
+    # 標題放 B 欄不放 A：A 欄是明細與總表逐列對齊的比對依據，
+    # 塞非科目的文字進去會讓 test_build 判定未對齊（實測 47 張表全炸）
+    put(ws, row, 2, "借貸差（應為 0；不為 0 代表有調整沒被 K 收走）")
+    rule = openpyxl.formatting.rule.FormulaRule(
+        formula=[f"$D${row}<>0"],
+        fill=openpyxl.styles.PatternFill("solid", start_color="FFFF8080"))
+    ws.conditional_formatting.add(f"B{row}:F{row}", rule)
+    return row
 
 
 def add_helper_columns(ws, header_row, lo, hi):
@@ -603,6 +667,11 @@ def add_helper_columns(ws, header_row, lo, hi):
             f'=IF(AND(C{r}<>"",COUNTIF($I${c_lo}:$I${c_hi},C{r})=0),"⚠借方代號無對應",'
             f'IF(AND(E{r}<>"",COUNTIF($I${c_lo}:$I${c_hi},E{r})=0),"⚠貸方代號無對應",""))')
         n += 1
+        # R 只放在「登得了帳」的科目列：G 用到自己那列的 B，代表這一列的 G
+        # 是 B±調整 算出來的，補一筆分錄真的會動到它。小計列（G 是別列的加總）
+        # 與總表（G 是 47 校跨表加總）補不了帳，掛「該補多少」只會誤導。
+        if not re.search(rf"\bB{r}\b", str(ws.cell(r, 7).value or "")):
+            continue
         if str(ws.cell(r, 13).value or "").startswith("="):
             d1, d2 = ("借", "貸") if r < liab else ("貸", "借")
             put(ws, r, 18,
@@ -1015,6 +1084,7 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     renamed = []
     dead_cf = []
     n_helper = 0
+    n_krange = 0
     final_titles = []
     for idx, name in enumerate(detail_names, start=1):
         ws = wb[name]
@@ -1058,7 +1128,9 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
         if ws.max_row > last:
             ws.delete_rows(last + 1, ws.max_row - last + 1)
         dead_cf += normalize_conditional_formatting(ws, last)
+        n_krange += align_k_range(ws)     # 要在 add_helper_columns 之前：N 欄抄的是 K 的範圍
         n_helper += add_helper_columns(ws, FROZEN_ROWS + 4, SKEL_START, last)
+        gap_row = flag_debit_credit_gap(ws)
         base = name.split("-")[0]
         if base != name:
             renamed.append((name, base))
@@ -1113,7 +1185,9 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     if wt.max_row > tail:
         wt.delete_rows(tail + 1, wt.max_row - tail + 1)
     dead_cf += normalize_conditional_formatting(wt, tail)
+    n_krange += align_k_range(wt)
     add_helper_columns(wt, SKEL_START + DETAIL_SHIFT, SKEL_START + DETAIL_SHIFT, tail)
+    gap_row = flag_debit_credit_gap(wt)
     for name in BLOCK_NAMES:
         b = new_blocks[name]
         head = "項      目" if name == "現流" else "科目"
@@ -1243,6 +1317,13 @@ def build(balance, cashflow, template=DEFAULT_TEMPLATE, output=None, year=None,
     if n_helper:
         report(f"\n已補填表輔助兩欄：N（借貸代號在 I 欄找不到就示警，"
                f"該筆調整不會被 K 收走）、R（依 M 算出還要補借方還是貸方、補多少）")
+    if n_krange:
+        report(f"\nK 的 SUMIF 範圍已對齊借貸總計的加總範圍（改寫 {n_krange} 格）——"
+               f"範本原本總表 $C$7:$C$127、明細 $C$8:$C$128，各有一列的破口；"
+               f"掉進破口的調整不會被 K 收走，而 P=J−K 仍是 0")
+    if gap_row:
+        report(f"借貸差（第 {gap_row} 列）已加標題與紅底標色——"
+               f"那是「有調整沒被 K 收走」的最後一道防線，原本沒有任何提示")
     if dead_cf:
         seen = collections.Counter(dead_cf)
         report(f"\n已移除死的條件式格式 {len(dead_cf)} 條"
