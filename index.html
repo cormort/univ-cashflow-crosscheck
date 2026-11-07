@@ -14,8 +14,15 @@
   .note { padding: .75rem 1rem; background: #eef6ee; border: 1px solid #cfe3cf;
           border-radius: .5rem; font-size: .9rem; color: #2c4a2c; margin-bottom: 1.5rem; }
   label { display: block; font-weight: 600; margin: 1rem 0 .35rem; }
-  input[type=file], input[type=text] { width: 100%; padding: .5rem; box-sizing: border-box;
+  input[type=text] { width: 100%; padding: .5rem; box-sizing: border-box;
           border: 1px solid #bbb; border-radius: .4rem; background: transparent; color: inherit; }
+  .drop { position: relative; margin: 0; padding: 1.5rem 1rem; text-align: center; font-weight: 400;
+          border: 2px dashed #bbb; border-radius: .5rem; cursor: pointer; word-break: break-all; }
+  .drop input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  .drop span { pointer-events: none; } /* 不讓子元素觸發 dragleave 造成閃爍 */
+  .drop:hover, .drop.over { border-color: #d05a1e; background: rgba(208, 90, 30, .1); }
+  .drop:focus-within { outline: 2px solid #d05a1e; outline-offset: 2px; }
+  .drop.has { border-style: solid; border-color: #1e7a3c; font-weight: 600; }
   button { margin-top: 1.5rem; width: 100%; padding: .75rem; font-size: 1rem; font-weight: 600;
            border: 0; border-radius: .4rem; background: #d05a1e; color: #fff; cursor: pointer; }
   button:disabled { background: #999; cursor: progress; }
@@ -48,10 +55,10 @@
 </div>
 
 <label for="bal">12.平衡（預計平衡表）</label>
-<input id="bal" type="file" accept=".xlsx,.xls" />
+<label class="drop"><input id="bal" type="file" accept=".xlsx,.xls" /><span>拖曳檔案到這裡，或點擊選擇</span></label>
 
 <label for="cf">3.現流（現金流量預計表）</label>
-<input id="cf" type="file" accept=".xlsx,.xls" />
+<label class="drop"><input id="cf" type="file" accept=".xlsx,.xls" /><span>拖曳檔案到這裡，或點擊選擇</span></label>
 
 <label for="year">年度（留空＝依來源檔標題自動判斷）</label>
 <input id="year" type="text" inputmode="numeric" placeholder="例如 115" />
@@ -164,6 +171,28 @@ _res
   }
   $("go").disabled = false;
   $("go").textContent = "產生勾稽底稿";
+}
+
+// 沒丟準時別讓瀏覽器直接開啟檔案、離開這頁
+for (const t of ["dragover", "drop"]) window.addEventListener(t, (e) => e.preventDefault());
+
+for (const zone of document.querySelectorAll(".drop")) {
+  const input = zone.querySelector("input"), text = zone.querySelector("span");
+  const hint = text.textContent;
+  input.addEventListener("change", () => {
+    const f = input.files[0];
+    text.textContent = f ? f.name : hint;
+    zone.classList.toggle("has", !!f);
+  });
+  zone.addEventListener("dragover", () => zone.classList.add("over"));
+  zone.addEventListener("dragleave", () => zone.classList.remove("over"));
+  zone.addEventListener("drop", (e) => {
+    zone.classList.remove("over");
+    const files = e.dataTransfer.files;
+    if (!/\.xlsx?$/i.test(files[0]?.name)) { log("只接受 .xlsx／.xls 檔。"); return; }
+    input.files = files;
+    input.dispatchEvent(new Event("change")); // 程式設定 files 不會自己觸發 change
+  });
 }
 
 $("go").addEventListener("click", run);
